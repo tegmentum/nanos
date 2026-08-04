@@ -79,13 +79,36 @@
 
 #define CRB_CTRL_START              0x00000001u
 
-/* Interface Id (low) — bits 0..3 identify interface family: 1 = CRB.  */
+/* Interface Id (low) — bits 0..3 identify interface family:
+ *   0x1 = pure CRB (rare in practice)
+ *   0xF = FIFO-over-TIS / CRB combined device, CRB is one of several
+ *         selectable interface modes. QEMU's tpm-crb device and most
+ *         real-hardware Intel PTT / Infineon parts report 0xF: the
+ *         "interface type" field advertises the device family, while
+ *         the "capabilities" field indicates which sub-modes are
+ *         actually supported. Accepting 0xF here matches the TPM2
+ *         reference implementation and the Linux tpm_crb driver.
+ * The driver treats both values as CRB-capable and relies on the
+ * CRB-specific register offsets below being valid for either.
+ */
 #define CRB_INTF_ID_TYPE_MASK       0xFu
 #define CRB_INTF_ID_TYPE_CRB        0x1u
+#define CRB_INTF_ID_TYPE_FIFO_CRB   0xFu
 #define CRB_INTF_ID_VERSION_MASK    0xF0u
 #define CRB_INTF_ID_VERSION_SHIFT   4
 #define CRB_INTF_ID_CAP_LOCALITY    (1u << 8)
 #define CRB_INTF_ID_CAP_IDLE_BYPASS (1u << 9)
+
+/* Offset of the CRB Control Area within a locality register block.
+ * Per TCG PC Client Platform TPM Profile (CRB Interface) Table 8-1,
+ * each locality's register block starts with the Locality State /
+ * Control / Status registers (0x00 .. 0x3F) followed by the CRB
+ * Control Area beginning at offset 0x40 (CTRL_REQ, CTRL_STS,
+ * CTRL_CANCEL, CTRL_START, ...). The ACPI TPM2 table's
+ * ControlAddress field points at the Control Area itself; the
+ * driver indexes from the locality base and therefore subtracts
+ * this offset when it consumes ControlAddress. */
+#define CRB_LOC_CTRL_AREA_OFFSET    0x40u
 
 /* Standard x86 QEMU CRB MMIO base — used only as a final-fallback in
  * discovery per design doc §4.4. Production images MUST prefer ACPI

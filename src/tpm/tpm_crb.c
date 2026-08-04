@@ -146,18 +146,31 @@ static boolean crb_interface_plausible(nanos_tpm tpm)
     u32 lo = reg32(tpm, CRB_REG_INTF_ID_LO);
     u32 type = lo & CRB_INTF_ID_TYPE_MASK;
 
-    if (type != CRB_INTF_ID_TYPE_CRB)
+    /* Accept both the pure-CRB (0x1) family and the combined
+     * FIFO+CRB (0xF) family. QEMU's tpm-crb device and real Intel PTT
+     * hardware report 0xF; earlier discovery would silently fall
+     * through and produce nanos_tpm_default()==NULL. */
+    if (type != CRB_INTF_ID_TYPE_CRB && type != CRB_INTF_ID_TYPE_FIFO_CRB) {
+        rprintf("tpm: crb interface rejected: intf_id_lo=0x%x type=0x%x\n",
+                lo, type);
         return false;
+    }
 
     /* A device that reports zero for both command and response buffer
      * size is either uninitialized or masquerading; refuse it. */
     u32 cmd_sz = reg32(tpm, CRB_REG_CMD_SIZE);
     u32 rsp_sz = reg32(tpm, CRB_REG_RSP_SIZE);
 
-    if (cmd_sz < TPM_MIN_COMMAND_BUFFER || cmd_sz > TPM_MAX_REASONABLE_BUFFER)
+    if (cmd_sz < TPM_MIN_COMMAND_BUFFER || cmd_sz > TPM_MAX_REASONABLE_BUFFER) {
+        rprintf("tpm: crb interface rejected: cmd_sz=0x%x out of range\n",
+                cmd_sz);
         return false;
-    if (rsp_sz < TPM_MIN_RESPONSE_BUFFER || rsp_sz > TPM_MAX_REASONABLE_BUFFER)
+    }
+    if (rsp_sz < TPM_MIN_RESPONSE_BUFFER || rsp_sz > TPM_MAX_REASONABLE_BUFFER) {
+        rprintf("tpm: crb interface rejected: rsp_sz=0x%x out of range\n",
+                rsp_sz);
         return false;
+    }
 
     tpm->maximum_command_size  = cmd_sz;
     tpm->maximum_response_size = rsp_sz;
@@ -198,11 +211,15 @@ static int try_discover_acpi(nanos_tpm tpm)
 {
     ACPI_TABLE_HEADER *t;
     ACPI_STATUS rv = AcpiGetTable(ACPI_SIG_TPM2, 1, &t);
-    if (ACPI_FAILURE(rv))
+    if (ACPI_FAILURE(rv)) {
+        rprintf("tpm: acpi discovery failed: no TPM2 table (rv=0x%x)\n", rv);
         return TPM_ERR_NO_DEVICE;
+    }
 
     /* Header sanity: length must cover at least the fixed rev-4 body. */
     if (t->Length < sizeof(ACPI_TABLE_TPM2)) {
+        rprintf("tpm: acpi discovery failed: TPM2 table too short (len=%d)\n",
+                t->Length);
         AcpiPutTable(t);
         return TPM_ERR_NO_DEVICE;
     }
@@ -213,22 +230,48 @@ static int try_discover_acpi(nanos_tpm tpm)
     AcpiPutTable(t);
 
     if (start != ACPI_TPM2_COMMAND_BUFFER &&
-        start != ACPI_TPM2_COMMAND_BUFFER_WITH_ARM_SMC)
+        start != ACPI_TPM2_COMMAND_BUFFER_WITH_ARM_SMC) {
+        rprintf("tpm: acpi discovery failed: unsupported start method %d\n",
+                start);
         return TPM_ERR_UNSUPPORTED;
+    }
 
-    if (!ctrl_addr)
+    if (!ctrl_addr) {
+        rprintf("tpm: acpi discovery failed: ControlAddress is zero\n");
         return TPM_ERR_NO_DEVICE;
+    }
+
+    /* The ACPI TPM2 ControlAddress field points at the CRB Control Area,
+     * which per TCG PC Client CRB Interface spec Table 8-1 lives at
+     * (locality_base + 0x40). The driver's CRB_REG_* offsets are all
+     * measured from the locality base (LOC_STATE at 0x00, INTF_ID at
+     * 0x30, CTRL_REQ at 0x40, ...), so we back up by 0x40 before
+     * mapping. Without this adjustment every register access on the
+     * ACPI path would land 0x40 bytes past its intended target and
+     * discovery would silently reject a perfectly valid device. */
+    if (ctrl_addr < CRB_LOC_CTRL_AREA_OFFSET) {
+        rprintf("tpm: acpi discovery failed: ControlAddress 0x%lx below "
+                "locality offset\n", ctrl_addr);
+        return TPM_ERR_NO_DEVICE;
+    }
+    u64 locality_base = ctrl_addr - CRB_LOC_CTRL_AREA_OFFSET;
 
     u64 length = CRB_QEMU_DEFAULT_MMIO_LEN;
-    void *mapped = tpm_map_mmio(ctrl_addr, length);
-    if (!mapped)
+    void *mapped = tpm_map_mmio(locality_base, length);
+    if (!mapped) {
+        rprintf("tpm: acpi discovery failed: map 0x%lx len 0x%lx\n",
+                locality_base, length);
         return TPM_ERR_INTERNAL;
+    }
 
     tpm->mmio_base   = mapped;
     tpm->mmio_length = length;
     tpm->mmio_ops    = crb_mmio_ops_real(mapped, length);
 
     if (!tpm->mmio_ops || !crb_interface_plausible(tpm)) {
+        rprintf("tpm: acpi discovery failed: interface implausible at "
+                "locality_base=0x%lx (control_addr=0x%lx)\n",
+                locality_base, ctrl_addr);
         tpm_unmap_mmio(mapped, length);
         tpm->mmio_base   = 0;
         tpm->mmio_length = 0;
@@ -261,17 +304,25 @@ static int try_discover_manifest(nanos_tpm tpm)
 static int try_discover_qemu_fixed(nanos_tpm tpm)
 {
     /* Final fallback per sec 4.4.  Map the standard x86 QEMU CRB base
-     * and only accept it if crb_interface_plausible() succeeds. */
+     * and only accept it if crb_interface_plausible() succeeds. The
+     * QEMU-fixed base names the locality-0 register block directly (no
+     * ACPI-style Control-Area offset adjustment needed). */
     void *mapped = tpm_map_mmio(CRB_QEMU_DEFAULT_MMIO_BASE,
                                 CRB_QEMU_DEFAULT_MMIO_LEN);
-    if (!mapped)
+    if (!mapped) {
+        rprintf("tpm: qemu-fixed discovery failed: map 0x%lx len 0x%lx\n",
+                (u64)CRB_QEMU_DEFAULT_MMIO_BASE,
+                (u64)CRB_QEMU_DEFAULT_MMIO_LEN);
         return TPM_ERR_NO_DEVICE;
+    }
 
     tpm->mmio_base   = mapped;
     tpm->mmio_length = CRB_QEMU_DEFAULT_MMIO_LEN;
     tpm->mmio_ops    = crb_mmio_ops_real(mapped, CRB_QEMU_DEFAULT_MMIO_LEN);
 
     if (!tpm->mmio_ops || !crb_interface_plausible(tpm)) {
+        rprintf("tpm: qemu-fixed discovery failed: interface implausible "
+                "at 0x%lx\n", (u64)CRB_QEMU_DEFAULT_MMIO_BASE);
         tpm_unmap_mmio(mapped, CRB_QEMU_DEFAULT_MMIO_LEN);
         tpm->mmio_base = 0;
         tpm->mmio_ops  = 0;
@@ -697,11 +748,22 @@ void init_tpm(kernel_heaps kh)
     nanos_tpm tpm = 0;
     int s = nanos_tpm_discover(&tpm, 0);
     if (s == TPM_ERR_OK) {
+        rprintf("tpm: discovery ok (source=%d cmd=0x%x rsp=0x%x)\n",
+                (int)tpm->discovery_source,
+                tpm->maximum_command_size,
+                tpm->maximum_response_size);
         nanos_tpm_set_default(tpm);
+    } else {
+        /* Absence of a TPM is a supported deployment shape (the syscall
+         * layer returns -ENOTSUP and wasmos-platform-nanos maps that
+         * back to a probe-catalog "unavailable" signal), but leaving no
+         * trace of _why_ discovery failed hid two driver bugs during
+         * Phase N3 boot verification. Emit a single terminal line so
+         * future boots surface the outcome; each stage above already
+         * printed its own per-stage reason. */
+        rprintf("tpm: discovery failed (err=%d) - device absent or "
+                "driver rejected all candidates\n", s);
     }
-    /* No log: absence of a TPM is a supported deployment shape; the
-     * syscall layer returns -ENOTSUP and wasmos-platform-nanos maps
-     * that back to a probe-catalog-level unavailable signal. */
 }
 
 /* -------------------------------------------------------------------- */
