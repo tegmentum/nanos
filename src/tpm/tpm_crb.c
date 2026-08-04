@@ -48,6 +48,30 @@
 #define TPM_MUTEX_SPIN_ITERATIONS   256
 
 /* -------------------------------------------------------------------- */
+/* TPM2_Startup(TPM_SU_CLEAR) command bytes (TCG TPM 2.0 Part 3, §9.3). */
+/*                                                                       */
+/* Real TPM hardware, and swtpm, both require a Startup command before  */
+/* any other command will succeed - a bare send of anything else comes  */
+/* back with TPM_RC_INITIALIZE (0x100). The driver issues this once at  */
+/* init so downstream userspace consumers never have to reinvent the    */
+/* workaround. Layout (big-endian):                                     */
+/*                                                                       */
+/*   tag           u16   0x8001  TPM_ST_NO_SESSIONS                     */
+/*   commandSize   u32   0x0C    12 bytes total                         */
+/*   commandCode   u32   0x144   TPM_CC_Startup                         */
+/*   startupType   u16   0x0000  TPM_SU_CLEAR                           */
+/* -------------------------------------------------------------------- */
+
+#define TPM_RC_INITIALIZE   0x00000100u
+
+static const u8 tpm2_startup_clear_cmd[12] = {
+    0x80, 0x01,             /* tag = TPM_ST_NO_SESSIONS */
+    0x00, 0x00, 0x00, 0x0C, /* commandSize = 12 */
+    0x00, 0x00, 0x01, 0x44, /* commandCode = TPM_CC_Startup */
+    0x00, 0x00,             /* startupType = TPM_SU_CLEAR */
+};
+
+/* -------------------------------------------------------------------- */
 /* Local helpers over Nanos-internal APIs.                               */
 /* -------------------------------------------------------------------- */
 
@@ -742,6 +766,64 @@ void nanos_tpm_set_default(nanos_tpm tpm)
     the_default_tpm = tpm;
 }
 
+/*
+ * Issue TPM2_Startup(TPM_SU_CLEAR) via the CRB transport.
+ *
+ * Real TPM hardware and swtpm both refuse every command with
+ * TPM_RC_INITIALIZE (0x100) until Startup has been called exactly once
+ * per power cycle. Kernel-side initialisation is the correct home for
+ * that call; the alternative - having every userspace consumer emit its
+ * own Startup as a workaround - does not scale.
+ *
+ * Return semantics matching the driver's TPM_ERR_* space:
+ *   TPM_ERR_OK        - responseCode was 0 (success) or 0x100 (already
+ *                       started; harmless idempotency).
+ *   TPM_ERR_TRANSPORT - transport failure, or an unexpected TPM
+ *                       responseCode. In either case the raw code has
+ *                       already been logged via rprintf.
+ *
+ * On failure the caller should mark the driver TPM_STATE_FAILED so the
+ * status syscall surfaces the condition; the driver does NOT panic -
+ * TPM policy is a userspace concern.
+ */
+static int tpm_issue_startup_clear(nanos_tpm tpm)
+{
+    u8 response[16];
+    bytes response_length = 0;
+
+    int s = nanos_tpm_transmit(tpm,
+                               tpm2_startup_clear_cmd,
+                               sizeof(tpm2_startup_clear_cmd),
+                               response, sizeof(response),
+                               &response_length,
+                               /* deadline = 0 -> use the per-instance
+                                * execution timeout (design doc §4.6). */
+                               0);
+    if (s != TPM_ERR_OK) {
+        rprintf("tpm: startup transport failed (err=%d)\n", s);
+        return TPM_ERR_TRANSPORT;
+    }
+
+    /* Response header is 10 bytes: tag(2) + size(4) + responseCode(4).
+     * transmit() already validated response_length >= header size and
+     * bounded it against our capacity, but re-check defensively. */
+    if (response_length < TPM2_HEADER_SIZE) {
+        rprintf("tpm: startup response truncated (len=%ld)\n",
+                (u64)response_length);
+        return TPM_ERR_TRANSPORT;
+    }
+
+    u32 rc = ((u32)response[6] << 24) | ((u32)response[7] << 16) |
+             ((u32)response[8] <<  8) | ((u32)response[9]);
+    if (rc == 0 || rc == TPM_RC_INITIALIZE) {
+        rprintf("tpm: startup ok (rc=0x%x)\n", rc);
+        return TPM_ERR_OK;
+    }
+
+    rprintf("tpm: startup failed (rc=0x%x)\n", rc);
+    return TPM_ERR_TRANSPORT;
+}
+
 void init_tpm(kernel_heaps kh)
 {
     (void)kh;   /* the driver reads through get_kernel_heaps() itself. */
@@ -752,6 +834,17 @@ void init_tpm(kernel_heaps kh)
                 (int)tpm->discovery_source,
                 tpm->maximum_command_size,
                 tpm->maximum_response_size);
+
+        /* Issue TPM2_Startup(TPM_SU_CLEAR) before publishing the device
+         * as the default. A Startup failure is diagnostic - flag the
+         * driver as FAILED so the status syscall surfaces the outcome,
+         * but keep the device published so userspace (and the status
+         * syscall itself) can inspect it. Do NOT panic. */
+        int ss = tpm_issue_startup_clear(tpm);
+        if (ss != TPM_ERR_OK) {
+            tpm->state      = TPM_STATE_FAILED;
+            tpm->last_error = ss;
+        }
         nanos_tpm_set_default(tpm);
     } else {
         /* Absence of a TPM is a supported deployment shape (the syscall
