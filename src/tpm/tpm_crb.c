@@ -67,28 +67,44 @@ static inline timestamp tpm_now(void)
 }
 
 /* Map `length` bytes of physical MMIO at `phys` into kernel virtual
- * space. `length` is rounded up internally by the mapping layer; the
- * caller passes the on-page-aligned physical base. Returns NULL on
- * failure. */
+ * space. `phys` may be at any byte alignment - the CRB control area
+ * lives at ControlAddress in the ACPI TPM2 table, and TCG PC Client
+ * CRB Table 8-1 aligns it on a 0x40 boundary within the underlying
+ * MMIO window rather than on a page boundary. Nanos's map() asserts
+ * page-aligned physical bases (src/kernel/page.c:551), so we round
+ * `phys` down to a page, pad the length to cover the intra-page
+ * offset, map that, and return a virtual pointer that already includes
+ * the offset so callers can index registers as `mmio_base + REG_OFF`.
+ * Returns NULL on failure. */
 static void *tpm_map_mmio(u64 phys, u64 length)
 {
     heap vh = tpm_vheap();
-    u64 aligned_len = pad(length, PAGESIZE);
-    void *v = allocate(vh, aligned_len);
+    u64 phys_page   = phys & ~PAGEMASK;
+    u64 offset      = phys - phys_page;
+    u64 mapped_len  = pad(offset + length, PAGESIZE);
+    void *v = allocate(vh, mapped_len);
     if (v == INVALID_ADDRESS)
         return 0;
-    map(u64_from_pointer(v), phys, aligned_len,
+    map(u64_from_pointer(v), phys_page, mapped_len,
         pageflags_writable(pageflags_device()));
-    return v;
+    return (u8 *)v + offset;
 }
 
+/* Reverse of tpm_map_mmio: `virt` is the offset-included pointer we
+ * returned from map_mmio, `length` is the originally requested byte
+ * count (same value the caller passed to map). Both intra-page offset
+ * and length padding are recovered here so callers do not need to
+ * remember the underlying page base. */
 static void tpm_unmap_mmio(void *virt, u64 length)
 {
     if (!virt)
         return;
-    u64 aligned_len = pad(length, PAGESIZE);
-    unmap(u64_from_pointer(virt), aligned_len);
-    deallocate(tpm_vheap(), virt, aligned_len);
+    u64 virt_addr   = u64_from_pointer(virt);
+    u64 virt_page   = virt_addr & ~PAGEMASK;
+    u64 offset      = virt_addr - virt_page;
+    u64 mapped_len  = pad(offset + length, PAGESIZE);
+    unmap(virt_page, mapped_len);
+    deallocate(tpm_vheap(), pointer_from_u64(virt_page), mapped_len);
 }
 
 /* -------------------------------------------------------------------- */
