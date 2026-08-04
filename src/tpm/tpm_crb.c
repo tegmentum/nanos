@@ -1,12 +1,9 @@
 /*
- * WasmOS TPM 2.0 CRB transport driver — implementation
+ * WasmOS TPM 2.0 CRB transport driver - implementation
  *
- * INTENDED NANOS PATH: kernel/tpm/tpm_crb.c
- * (adjust to match the target Nanos SHA's kernel layout — this driver
- * is deliberately not wired into any Makefile; do that in the
- * integration commit for the target checkout).
+ * NANOS PATH: src/tpm/tpm_crb.c
  *
- * Companion design: docs/design/nanos-tpm-crb-transport.md §4 in the
+ * Companion design: docs/design/nanos-tpm-crb-transport.md sec 4 in the
  * wasmos repository. All section references below cite that doc.
  *
  * Invariants:
@@ -16,13 +13,24 @@
  *     BEFORE any bytes are copied out of the CRB region.
  *   - Temporary buffers holding potentially sensitive data are zeroed
  *     with an unwritable-through-optimizer helper.
- *   - No user pointer reaches this file directly — the syscall shim
- *     (see 0002-tpm-syscall-abi.patch) has already copied user data
- *     into kernel buffers before calling in.
+ *   - No user pointer reaches this file directly - the syscall shim
+ *     (tpm_syscall.c) has already copied user data into kernel buffers
+ *     before calling in.
+ *
+ * Nanos integration notes (deviations from the wasmos-side design):
+ *   - Nanos `status` is a tuple (src/runtime/status.h), so this driver
+ *     returns `int` and uses the TPM_ERR_* enumeration.
+ *   - Nanos time comes from now(CLOCK_ID_MONOTONIC_RAW), which returns a
+ *     fixed-point `timestamp` value where 1s == (1ull << 32). We store
+ *     configured timeouts in nanoseconds for the user ABI and convert
+ *     to Nanos timestamps via nanoseconds() at deadline evaluation time.
+ *   - Kernel allocation uses `heap_locked(get_kernel_heaps())`; MMIO
+ *     mapping uses `heap_virtual_page` + map() with pageflags_device().
+ *   - Mutex is allocated with allocate_mutex().
  */
 
-#include "tpm_crb.h"
-#include "tpm_crb_mmio.h"
+#include <kernel.h>
+#include <tpm/tpm_crb.h>
 
 /* -------------------------------------------------------------------- */
 /* Minimum plausible sizes.  A CRB device reporting less than this is   */
@@ -33,6 +41,54 @@
 #define TPM_MIN_COMMAND_BUFFER      1024
 #define TPM_MIN_RESPONSE_BUFFER     1024
 #define TPM_MAX_REASONABLE_BUFFER   (128u * 1024u)
+
+/* Nanos-internal spin count for allocate_mutex(); mirrors the value
+ * used by other drivers that grab short critical sections. */
+#define TPM_MUTEX_SPIN_ITERATIONS   256
+
+/* -------------------------------------------------------------------- */
+/* Local helpers over Nanos-internal APIs.                               */
+/* -------------------------------------------------------------------- */
+
+static inline heap tpm_heap(void)
+{
+    return heap_locked(get_kernel_heaps());
+}
+
+static inline heap tpm_vheap(void)
+{
+    return (heap)heap_virtual_page(get_kernel_heaps());
+}
+
+static inline timestamp tpm_now(void)
+{
+    return now(CLOCK_ID_MONOTONIC_RAW);
+}
+
+/* Map `length` bytes of physical MMIO at `phys` into kernel virtual
+ * space. `length` is rounded up internally by the mapping layer; the
+ * caller passes the on-page-aligned physical base. Returns NULL on
+ * failure. */
+static void *tpm_map_mmio(u64 phys, u64 length)
+{
+    heap vh = tpm_vheap();
+    u64 aligned_len = pad(length, PAGESIZE);
+    void *v = allocate(vh, aligned_len);
+    if (v == INVALID_ADDRESS)
+        return 0;
+    map(u64_from_pointer(v), phys, aligned_len,
+        pageflags_writable(pageflags_device()));
+    return v;
+}
+
+static void tpm_unmap_mmio(void *virt, u64 length)
+{
+    if (!virt)
+        return;
+    u64 aligned_len = pad(length, PAGESIZE);
+    unmap(u64_from_pointer(virt), aligned_len);
+    deallocate(tpm_vheap(), virt, aligned_len);
+}
 
 /* -------------------------------------------------------------------- */
 /* Utility: constant-time zeroization.                                   */
@@ -59,18 +115,13 @@ static inline void set32(nanos_tpm tpm, u64 off, u32 v)
     tpm->mmio_ops->write32(tpm->mmio_ops->cookie, off, v);
 }
 
-static inline u64 reg64(nanos_tpm tpm, u64 off)
-{
-    return tpm->mmio_ops->read64(tpm->mmio_ops->cookie, off);
-}
-
 static inline void mmio_mb(nanos_tpm tpm)
 {
     tpm->mmio_ops->mb(tpm->mmio_ops->cookie);
 }
 
 /* -------------------------------------------------------------------- */
-/* Interface validation (design doc §4.4).                               */
+/* Interface validation (design doc sec 4.4).                            */
 /* -------------------------------------------------------------------- */
 
 static boolean crb_interface_plausible(nanos_tpm tpm)
@@ -98,41 +149,44 @@ static boolean crb_interface_plausible(nanos_tpm tpm)
 }
 
 /* -------------------------------------------------------------------- */
-/* Discovery (design doc §4.4).                                          */
+/* Discovery (design doc sec 4.4).                                       */
 /* -------------------------------------------------------------------- */
 
-static status try_discover_acpi(nanos_tpm tpm)
+static int try_discover_acpi(nanos_tpm tpm)
 {
     /* TODO(nanos-integration): resolve ACPI TPM2 table -> mmio_base +
-     * mmio_length via the target Nanos SHA's ACPI parser.  For now
-     * this returns NO_DEVICE, prompting fallback. */
+     * mmio_length via Nanos's acpica-backed table lookup. Requires an
+     * AcpiGetTable(ACPI_SIG_TPM2, ...) call and a subsequent map()
+     * against the returned address. Deferred to a follow-up commit
+     * so that we ship a working QEMU fallback in Phase N2. */
     (void)tpm;
     return TPM_ERR_NO_DEVICE;
 }
 
-static status try_discover_platform(nanos_tpm tpm)
+static int try_discover_platform(nanos_tpm tpm)
 {
-    /* TODO(nanos-integration): consult the platform device description
-     * table produced by the boot loader; hook depends on the target
-     * Nanos SHA. */
+    /* Reserved for platform-provided device descriptions (e.g. an EFI
+     * config table). Not implemented for the pc/QEMU platform. */
     (void)tpm;
     return TPM_ERR_NO_DEVICE;
 }
 
-static status try_discover_manifest(nanos_tpm tpm)
+static int try_discover_manifest(nanos_tpm tpm)
 {
-    /* TODO(nanos-integration): consult the Nanos boot manifest for an
-     * explicit tpm.crb.base / tpm.crb.length entry. */
+    /* TODO(nanos-integration): look up an explicit tpm.crb.base /
+     * tpm.crb.length entry in the boot manifest via get_root_tuple().
+     * Deferred; the QEMU fallback covers the current wasmos test
+     * matrix. */
     (void)tpm;
     return TPM_ERR_NO_DEVICE;
 }
 
-static status try_discover_qemu_fixed(nanos_tpm tpm)
+static int try_discover_qemu_fixed(nanos_tpm tpm)
 {
-    /* Final fallback per §4.4.  Map the standard x86 QEMU CRB base and
-     * only accept it if crb_interface_plausible() succeeds. */
-    void *mapped = map_mmio_region(CRB_QEMU_DEFAULT_MMIO_BASE,
-                                   CRB_QEMU_DEFAULT_MMIO_LEN);
+    /* Final fallback per sec 4.4.  Map the standard x86 QEMU CRB base
+     * and only accept it if crb_interface_plausible() succeeds. */
+    void *mapped = tpm_map_mmio(CRB_QEMU_DEFAULT_MMIO_BASE,
+                                CRB_QEMU_DEFAULT_MMIO_LEN);
     if (!mapped)
         return TPM_ERR_NO_DEVICE;
 
@@ -141,7 +195,7 @@ static status try_discover_qemu_fixed(nanos_tpm tpm)
     tpm->mmio_ops    = crb_mmio_ops_real(mapped, CRB_QEMU_DEFAULT_MMIO_LEN);
 
     if (!tpm->mmio_ops || !crb_interface_plausible(tpm)) {
-        unmap_mmio_region(mapped, CRB_QEMU_DEFAULT_MMIO_LEN);
+        tpm_unmap_mmio(mapped, CRB_QEMU_DEFAULT_MMIO_LEN);
         tpm->mmio_base = 0;
         tpm->mmio_ops  = 0;
         return TPM_ERR_NO_DEVICE;
@@ -151,13 +205,14 @@ static status try_discover_qemu_fixed(nanos_tpm tpm)
     return TPM_ERR_OK;
 }
 
-status nanos_tpm_discover(nanos_tpm *out, const crb_mmio_ops *ops)
+int nanos_tpm_discover(nanos_tpm *out, const crb_mmio_ops *ops)
 {
     if (!out)
         return TPM_ERR_INVAL;
 
-    nanos_tpm tpm = allocate_zero(sizeof(*tpm));
-    if (!tpm)
+    heap h = tpm_heap();
+    nanos_tpm tpm = allocate_zero(h, sizeof(*tpm));
+    if (tpm == INVALID_ADDRESS)
         return TPM_ERR_INTERNAL;
 
     tpm->state    = TPM_STATE_UNINITIALIZED;
@@ -167,24 +222,28 @@ status nanos_tpm_discover(nanos_tpm *out, const crb_mmio_ops *ops)
     tpm->timeouts.execution_ns  = NANOS_TPM_DEFAULT_EXECUTION_NS;
     tpm->timeouts.cancel_ns     = NANOS_TPM_DEFAULT_CANCEL_NS;
     tpm->timeouts.recovery_ns   = NANOS_TPM_DEFAULT_RECOVERY_NS;
-    tpm->command_lock = mutex_new();
+    tpm->command_lock = allocate_mutex(h, TPM_MUTEX_SPIN_ITERATIONS);
+    if (tpm->command_lock == INVALID_ADDRESS) {
+        deallocate(h, tpm, sizeof(*tpm));
+        return TPM_ERR_INTERNAL;
+    }
 
     /* Test-injected ops override the discovery pipeline entirely. */
     if (ops) {
         tpm->mmio_ops = ops;
         if (!crb_interface_plausible(tpm)) {
-            mutex_free(tpm->command_lock);
-            deallocate(tpm, sizeof(*tpm));
+            deallocate(h, tpm->command_lock, sizeof(struct mutex));
+            deallocate(h, tpm, sizeof(*tpm));
             return TPM_ERR_NO_DEVICE;
         }
         tpm->discovery_source = TPM_DISCOVERY_PLATFORM;
-        tpm->state = TPM_STATE_DISCOVERED;
+        tpm->state = TPM_STATE_READY;
         *out = tpm;
         return TPM_ERR_OK;
     }
 
-    /* Ordered discovery per §4.4. */
-    status s = try_discover_acpi(tpm);
+    /* Ordered discovery per sec 4.4. */
+    int s = try_discover_acpi(tpm);
     if (s == TPM_ERR_NO_DEVICE)
         s = try_discover_platform(tpm);
     if (s == TPM_ERR_NO_DEVICE)
@@ -193,17 +252,17 @@ status nanos_tpm_discover(nanos_tpm *out, const crb_mmio_ops *ops)
         s = try_discover_qemu_fixed(tpm);
 
     if (s != TPM_ERR_OK) {
-        mutex_free(tpm->command_lock);
-        deallocate(tpm, sizeof(*tpm));
+        deallocate(h, tpm->command_lock, sizeof(struct mutex));
+        deallocate(h, tpm, sizeof(*tpm));
         return s;
     }
 
-    tpm->state = TPM_STATE_DISCOVERED;
+    tpm->state = TPM_STATE_READY;
     *out = tpm;
     return TPM_ERR_OK;
 }
 
-status nanos_tpm_configure(nanos_tpm tpm, const nanos_tpm_timeouts *t)
+int nanos_tpm_configure(nanos_tpm tpm, const nanos_tpm_timeouts *t)
 {
     if (!tpm || !t)
         return TPM_ERR_INVAL;
@@ -219,30 +278,51 @@ void nanos_tpm_destroy(nanos_tpm tpm)
 {
     if (!tpm)
         return;
+    heap h = tpm_heap();
     if (tpm->mmio_base && tpm->mmio_length)
-        unmap_mmio_region(tpm->mmio_base, tpm->mmio_length);
-    if (tpm->command_lock)
-        mutex_free(tpm->command_lock);
+        tpm_unmap_mmio(tpm->mmio_base, tpm->mmio_length);
+    if (tpm->command_lock && tpm->command_lock != INVALID_ADDRESS)
+        deallocate(h, tpm->command_lock, sizeof(struct mutex));
     secure_zero(tpm, sizeof(*tpm));
-    deallocate(tpm, sizeof(*tpm));
+    deallocate(h, tpm, sizeof(*tpm));
+}
+
+/* -------------------------------------------------------------------- */
+/* Deadline arithmetic.                                                  */
+/*                                                                       */
+/* Nanos timestamps are 32.32 fixed-point with 1s == (1ull << 32).       */
+/* Configured timeouts are stored in nanoseconds (matching the user      */
+/* ABI); we convert them via nanoseconds() at deadline evaluation time. */
+/* -------------------------------------------------------------------- */
+
+static inline timestamp deadline_from_ns(u64 ns)
+{
+    return tpm_now() + nanoseconds(ns);
+}
+
+static inline timestamp effective_deadline(timestamp caller_deadline, u64 ns_budget)
+{
+    timestamp local = deadline_from_ns(ns_budget);
+    if (caller_deadline == 0)
+        return local;
+    return (caller_deadline < local) ? caller_deadline : local;
 }
 
 /* -------------------------------------------------------------------- */
 /* Locality management.                                                  */
 /* -------------------------------------------------------------------- */
 
-static status crb_acquire_locality(nanos_tpm tpm, timestamp deadline)
+static int crb_acquire_locality(nanos_tpm tpm, timestamp deadline)
 {
     set32(tpm, CRB_REG_LOC_CTRL, CRB_LOC_CTRL_REQ_ACCESS);
     mmio_mb(tpm);
 
-    timestamp t_end = deadline_min(deadline,
-                                   now() + tpm->timeouts.locality_ns);
-    while (now() < t_end) {
+    timestamp t_end = effective_deadline(deadline, tpm->timeouts.locality_ns);
+    while (tpm_now() < t_end) {
         u32 sts = reg32(tpm, CRB_REG_LOC_STS);
         if (sts & CRB_LOC_STS_GRANTED)
             return TPM_ERR_OK;
-        kernel_yield();
+        kern_pause();
     }
     return TPM_ERR_TIMEDOUT;
 }
@@ -257,20 +337,19 @@ static void crb_release_locality(nanos_tpm tpm)
 /* Command readiness.                                                    */
 /* -------------------------------------------------------------------- */
 
-static status crb_wait_ready(nanos_tpm tpm, timestamp deadline)
+static int crb_wait_ready(nanos_tpm tpm, timestamp deadline)
 {
     set32(tpm, CRB_REG_CTRL_REQ, CRB_CTRL_REQ_CMD_READY);
     mmio_mb(tpm);
 
-    timestamp t_end = deadline_min(deadline,
-                                   now() + tpm->timeouts.readiness_ns);
-    while (now() < t_end) {
+    timestamp t_end = effective_deadline(deadline, tpm->timeouts.readiness_ns);
+    while (tpm_now() < t_end) {
         u32 sts = reg32(tpm, CRB_REG_CTRL_STS);
         if (sts & CRB_CTRL_STS_ERROR)
             return TPM_ERR_TRANSPORT;
         if (!(sts & CRB_CTRL_STS_IDLE))
             return TPM_ERR_OK;
-        kernel_yield();
+        kern_pause();
     }
     return TPM_ERR_TIMEDOUT;
 }
@@ -279,31 +358,31 @@ static status crb_wait_ready(nanos_tpm tpm, timestamp deadline)
 /* Command execution wait.                                               */
 /* -------------------------------------------------------------------- */
 
-static status crb_wait_completion(nanos_tpm tpm, timestamp deadline)
+static int crb_wait_completion(nanos_tpm tpm, timestamp deadline)
 {
-    while (now() < deadline) {
+    while (tpm_now() < deadline) {
         u32 sts = reg32(tpm, CRB_REG_CTRL_STS);
         if (sts & CRB_CTRL_STS_ERROR)
             return TPM_ERR_TRANSPORT;
         u32 start = reg32(tpm, CRB_REG_CTRL_START);
         if ((start & CRB_CTRL_START) == 0)
             return TPM_ERR_OK;
-        kernel_yield();
+        kern_pause();
     }
     return TPM_ERR_TIMEDOUT;
 }
 
 /* -------------------------------------------------------------------- */
-/* Response length extraction — bounds-checked against caller capacity. */
+/* Response length extraction - bounds-checked against caller capacity.  */
 /* -------------------------------------------------------------------- */
 
-static status crb_extract_response_length(nanos_tpm tpm,
-                                          bytes response_capacity,
-                                          bytes *out_len)
+static int crb_extract_response_length(nanos_tpm tpm,
+                                       bytes response_capacity,
+                                       bytes *out_len)
 {
     /* TPM 2.0 response header layout:
      *   [0..1] tag (u16 BE)
-     *   [2..5] responseSize (u32 BE) — total including header
+     *   [2..5] responseSize (u32 BE) - total including header
      *   [6..9] responseCode (u32 BE)
      */
     u8 hdr[TPM2_HEADER_SIZE];
@@ -320,10 +399,10 @@ static status crb_extract_response_length(nanos_tpm tpm,
 }
 
 /* -------------------------------------------------------------------- */
-/* Transmit (design doc §4.3).                                           */
+/* Transmit (design doc sec 4.3).                                        */
 /* -------------------------------------------------------------------- */
 
-status nanos_tpm_transmit(
+int nanos_tpm_transmit(
     nanos_tpm tpm,
     const void *command,
     bytes command_length,
@@ -350,23 +429,22 @@ status nanos_tpm_transmit(
         tpm->state == TPM_STATE_SHUTDOWN)
         return TPM_ERR_NO_DEVICE;
 
-    /* Single-in-flight enforcement per §4.3. */
+    /* Single-in-flight enforcement per sec 4.3. */
     if (!mutex_try_lock(tpm->command_lock))
         return TPM_ERR_BUSY;
 
-    status s;
+    int s;
     tpm->state = TPM_STATE_BUSY;
 
     /* Effective deadline is the tighter of (caller deadline,
      * per-instance execution timeout). */
-    timestamp effective_deadline =
-        deadline_min(deadline, now() + tpm->timeouts.execution_ns);
+    timestamp exec_deadline = effective_deadline(deadline, tpm->timeouts.execution_ns);
 
-    s = crb_acquire_locality(tpm, effective_deadline);
+    s = crb_acquire_locality(tpm, exec_deadline);
     if (s != TPM_ERR_OK)
         goto out;
 
-    s = crb_wait_ready(tpm, effective_deadline);
+    s = crb_wait_ready(tpm, exec_deadline);
     if (s != TPM_ERR_OK)
         goto release_loc;
 
@@ -379,7 +457,7 @@ status nanos_tpm_transmit(
     set32(tpm, CRB_REG_CTRL_START, CRB_CTRL_START);
     mmio_mb(tpm);
 
-    s = crb_wait_completion(tpm, effective_deadline);
+    s = crb_wait_completion(tpm, exec_deadline);
     if (s != TPM_ERR_OK)
         goto release_loc;
 
@@ -391,7 +469,7 @@ status nanos_tpm_transmit(
     tpm->mmio_ops->read_bytes(tpm->mmio_ops->cookie,
                               CRB_REG_RSP_LOW, response, *response_length);
 
-    tpm->last_success = now();
+    tpm->last_success = tpm_now();
 
 release_loc:
     crb_release_locality(tpm);
@@ -410,49 +488,49 @@ out:
 }
 
 /* -------------------------------------------------------------------- */
-/* Recovery (design doc §4.5).                                           */
+/* Recovery (design doc sec 4.5).                                        */
 /* -------------------------------------------------------------------- */
 
-static status crb_cancel(nanos_tpm tpm)
+static int crb_cancel(nanos_tpm tpm)
 {
     set32(tpm, CRB_REG_CTRL_CANCEL, CRB_CTRL_CANCEL_YES);
     mmio_mb(tpm);
 
-    timestamp t_end = now() + tpm->timeouts.cancel_ns;
-    while (now() < t_end) {
+    timestamp t_end = deadline_from_ns(tpm->timeouts.cancel_ns);
+    while (tpm_now() < t_end) {
         u32 start = reg32(tpm, CRB_REG_CTRL_START);
         if ((start & CRB_CTRL_START) == 0) {
             set32(tpm, CRB_REG_CTRL_CANCEL, CRB_CTRL_CANCEL_NO);
             mmio_mb(tpm);
             return TPM_ERR_OK;
         }
-        kernel_yield();
+        kern_pause();
     }
     set32(tpm, CRB_REG_CTRL_CANCEL, CRB_CTRL_CANCEL_NO);
     mmio_mb(tpm);
     return TPM_ERR_TIMEDOUT;
 }
 
-status nanos_tpm_recover(nanos_tpm tpm)
+int nanos_tpm_recover(nanos_tpm tpm)
 {
     if (!tpm)
         return TPM_ERR_INVAL;
 
     mutex_lock(tpm->command_lock);
 
-    timestamp end = now() + tpm->timeouts.recovery_ns;
-    status s;
+    timestamp end = deadline_from_ns(tpm->timeouts.recovery_ns);
+    int s;
 
-    /* Step 1 — Attempt CRB cancellation. */
+    /* Step 1 - Attempt CRB cancellation. */
     s = crb_cancel(tpm);
-    if (s != TPM_ERR_OK && now() >= end)
+    if (s != TPM_ERR_OK && tpm_now() >= end)
         goto fail;
 
-    /* Step 2 — Reset driver-local state. */
+    /* Step 2 - Reset driver-local state. */
     tpm->locality      = 0;
     tpm->last_error    = TPM_ERR_OK;
 
-    /* Step 3 — Revalidate interface registers. */
+    /* Step 3 - Revalidate interface registers. */
     if (!crb_interface_plausible(tpm))
         goto fail;
 
@@ -461,14 +539,14 @@ status nanos_tpm_recover(nanos_tpm tpm)
     return TPM_ERR_OK;
 
 fail:
-    /* Step 4 — Mark unhealthy; further calls will be rejected. */
+    /* Step 4 - Mark unhealthy; further calls will be rejected. */
     tpm->state      = TPM_STATE_FAILED;
     tpm->last_error = TPM_ERR_UNHEALTHY;
     mutex_unlock(tpm->command_lock);
     return TPM_ERR_UNHEALTHY;
 }
 
-status nanos_tpm_reinitialize(nanos_tpm tpm)
+int nanos_tpm_reinitialize(nanos_tpm tpm)
 {
     if (!tpm)
         return TPM_ERR_INVAL;
@@ -476,7 +554,7 @@ status nanos_tpm_reinitialize(nanos_tpm tpm)
     mutex_lock(tpm->command_lock);
 
     /* Reset state; caller is responsible for evaluating deployment
-     * policy before invoking this — see §4.5. */
+     * policy before invoking this - see sec 4.5. */
     tpm->state      = TPM_STATE_UNINITIALIZED;
     tpm->locality   = 0;
     tpm->last_error = TPM_ERR_OK;
@@ -494,10 +572,10 @@ status nanos_tpm_reinitialize(nanos_tpm tpm)
 }
 
 /* -------------------------------------------------------------------- */
-/* Health snapshot (design doc §5.3).                                    */
+/* Health snapshot (design doc sec 5.3).                                 */
 /* -------------------------------------------------------------------- */
 
-status nanos_tpm_get_health(nanos_tpm tpm, nanos_tpm_health *out)
+int nanos_tpm_get_health(nanos_tpm tpm, nanos_tpm_health *out)
 {
     if (!tpm || !out)
         return TPM_ERR_INVAL;
@@ -512,12 +590,11 @@ status nanos_tpm_get_health(nanos_tpm tpm, nanos_tpm_health *out)
 }
 
 /* -------------------------------------------------------------------- */
-/* Global default instance — used by the syscall shim in patch 0002.    */
-/* Kernel init (integration commit) is expected to:                     */
-/*   1. call nanos_tpm_discover(&tpm, NULL)                              */
-/*   2. call nanos_tpm_set_default(tpm)                                  */
-/* Failure to discover leaves the default at NULL, in which case the    */
-/* syscall returns -ENOTSUP.                                             */
+/* Global default instance - used by the syscall shim in tpm_syscall.c.  */
+/* Kernel init calls init_tpm() below, which performs discovery and     */
+/* installs the resulting object as the default. Failure to discover   */
+/* leaves the default at NULL, in which case the syscall returns       */
+/* -ENOTSUP.                                                            */
 /* -------------------------------------------------------------------- */
 
 static nanos_tpm the_default_tpm = 0;
@@ -530,6 +607,19 @@ nanos_tpm nanos_tpm_default(void)
 void nanos_tpm_set_default(nanos_tpm tpm)
 {
     the_default_tpm = tpm;
+}
+
+void init_tpm(kernel_heaps kh)
+{
+    (void)kh;   /* the driver reads through get_kernel_heaps() itself. */
+    nanos_tpm tpm = 0;
+    int s = nanos_tpm_discover(&tpm, 0);
+    if (s == TPM_ERR_OK) {
+        nanos_tpm_set_default(tpm);
+    }
+    /* No log: absence of a TPM is a supported deployment shape; the
+     * syscall layer returns -ENOTSUP and wasmos-platform-nanos maps
+     * that back to a probe-catalog-level unavailable signal. */
 }
 
 /* -------------------------------------------------------------------- */

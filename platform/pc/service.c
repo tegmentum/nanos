@@ -19,6 +19,7 @@
 #include <xen_platform.h>
 #include <virtio/virtio.h>
 #include <vmware/vmware.h>
+#include <tpm/tpm_crb.h>
 #include "pvm.h"
 #include "serial.h"
 
@@ -532,6 +533,14 @@ void detect_devices(kernel_heaps kh, storage_attach sa)
 
     init_virtio_balloon(kh);
     init_virtio_rng(kh);
+
+    /* WasmOS-on-Nanos: TPM 2.0 CRB discovery + default binding.
+     * Runs after init_acpi() so the ACPI TPM2 table (once wired) is
+     * available to the discovery pipeline; on hosts without a TPM the
+     * QEMU-fixed fallback silently declines and the syscall layer
+     * reports -ENOTSUP. See docs/design/nanos-tpm-crb-transport.md
+     * sec 4.4 in the wasmos repository. */
+    init_tpm(kh);
 }
 
 void cmdline_consume(sstring opt_name, cmdline_handler h)

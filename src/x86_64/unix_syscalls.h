@@ -336,4 +336,15 @@
 #define SYS_io_uring_register			427
 #define SYS_clone3				435
 
-#define SYS_MAX 451
+/* WasmOS-on-Nanos: TPM 2.0 CRB syscalls (design doc sec 5).
+ *
+ * Numbers are chosen well above the current Linux top-of-table and
+ * above SYS_MAX so they cannot collide with a future Linux syscall
+ * that Nanos might adopt. The wasmos-side ABI is defined in
+ * src/tpm/tpm_syscall.h; both handlers live in src/tpm/tpm_syscall.c
+ * and are registered by register_tpm_syscalls() in that file.
+ */
+#define SYS_nanos_tpm_command			500
+#define SYS_nanos_tpm_status			501
+
+#define SYS_MAX 502

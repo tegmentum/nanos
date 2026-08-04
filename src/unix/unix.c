@@ -5,6 +5,10 @@
 #include <drivers/console.h>
 #include <ltrace.h>
 
+#ifdef __x86_64__
+#include <tpm/tpm_syscall.h>
+#endif
+
 //#define PF_DEBUG
 #ifdef PF_DEBUG
 #define pf_debug(x, ...) do {tprintf(sym(fault), 0, ss("tid %02d " x "\n"), \
@@ -718,6 +722,11 @@ process init_unix(kernel_heaps kh, tuple root, filesystem fs)
     register_clock_syscalls(linux_syscalls);
     register_timer_syscalls(linux_syscalls);
     register_other_syscalls(linux_syscalls);
+#ifdef __x86_64__
+    /* WasmOS-on-Nanos: TPM 2.0 CRB syscalls (design doc sec 5). Only
+     * built for x86_64/pc where the CRB driver is wired in. */
+    register_tpm_syscalls(linux_syscalls);
+#endif
 
     tuple coredumplimit = get(root, sym(coredumplimit));
     if (coredumplimit && is_string(coredumplimit)) {

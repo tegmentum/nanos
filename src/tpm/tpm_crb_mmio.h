@@ -1,10 +1,10 @@
 /*
- * WasmOS TPM 2.0 CRB — MMIO register-access seam
+ * WasmOS TPM 2.0 CRB - MMIO register-access seam
  *
- * INTENDED NANOS PATH: kernel/tpm/tpm_crb_mmio.h
+ * NANOS PATH: src/tpm/tpm_crb_mmio.h
  *
- * Design doc §8.1: "The CRB register layer MUST be abstracted so tests
- * can substitute a fake MMIO implementation — real hardware in unit
+ * Design doc sec 8.1: "The CRB register layer MUST be abstracted so tests
+ * can substitute a fake MMIO implementation - real hardware in unit
  * tests is a non-starter."
  *
  * This header defines the abstract ops table. The production
@@ -14,10 +14,9 @@
  * unit test can assert on register-access sequences.
  */
 
-#ifndef _KERNEL_TPM_TPM_CRB_MMIO_H_
-#define _KERNEL_TPM_TPM_CRB_MMIO_H_
-
-#include <kernel.h>
+/* Nanos headers use no include guards - each header is expected to be
+ * included exactly once from a .c file that has already pulled in
+ * <runtime.h> / <kernel.h>.  Do NOT #include <kernel.h> here. */
 
 /* -------------------------------------------------------------------- */
 /* CRB register offsets (TCG PC Client Platform TPM Profile — CRB       */
@@ -121,5 +120,3 @@ typedef struct crb_mmio_ops {
  * range that has already been mapped by the platform. Returns NULL on
  * mapping failure. */
 const crb_mmio_ops *crb_mmio_ops_real(void *virt_base, u64 length);
-
-#endif /* _KERNEL_TPM_TPM_CRB_MMIO_H_ */
