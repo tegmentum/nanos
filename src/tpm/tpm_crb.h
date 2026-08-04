@@ -75,6 +75,9 @@ typedef enum {
 #define TPM_ERR_BUSY            5  /* single-in-flight rejection */
 #define TPM_ERR_UNHEALTHY       6  /* recovery failed; explicit reinit required */
 #define TPM_ERR_INTERNAL        7  /* driver-internal invariant violation */
+#define TPM_ERR_UNSUPPORTED     8  /* discovered device uses an interface this
+                                      driver does not implement (e.g. TIS, or
+                                      a non-CRB ACPI TPM2 start method) */
 
 /* -------------------------------------------------------------------- */
 /* Per-instance timeout configuration (design doc sec 4.6)               */

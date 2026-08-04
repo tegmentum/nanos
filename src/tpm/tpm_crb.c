@@ -30,6 +30,7 @@
  */
 
 #include <kernel.h>
+#include <acpi.h>
 #include <tpm/tpm_crb.h>
 
 /* -------------------------------------------------------------------- */
@@ -152,15 +153,75 @@ static boolean crb_interface_plausible(nanos_tpm tpm)
 /* Discovery (design doc sec 4.4).                                       */
 /* -------------------------------------------------------------------- */
 
+/*
+ * ACPI TPM2 table discovery (design doc sec 4.4, primary source).
+ *
+ * The TCG "ACPI Specification for TPM 2.0" (Family 2.0, Rev 1.2 Rev 8)
+ * defines the TPM2 table shape used here; ACPICA exposes it as
+ * ACPI_TABLE_TPM2 in vendor/acpica/source/include/actbl3.h. Minimum
+ * revision-4 body is 16 bytes past the ACPI common header:
+ *
+ *   PlatformClass  u16
+ *   Reserved       u16
+ *   ControlAddress u64   <- CRB control-area physical base
+ *   StartMethod    u32
+ *
+ * We accept only start methods that describe a CRB-family interface:
+ *   ACPI_TPM2_COMMAND_BUFFER              (7)  - MMIO CRB (x86, generic)
+ *   ACPI_TPM2_COMMAND_BUFFER_WITH_ARM_SMC (11) - CRB with ARM SMC start
+ *
+ * Any other start method (notably TIS-family or ACPI-start) is reported
+ * as TPM_ERR_UNSUPPORTED so the caller can distinguish "no TPM" from
+ * "TPM present but not a CRB device this driver knows how to drive".
+ * The MMIO window length isn't in the ACPI table; we map the same
+ * 0x5000-byte window used by the QEMU fallback, which covers the CRB
+ * register block plus localities 0..4 per TCG PC Client CRB spec Table
+ * 8-1 (4 KiB per locality).
+ */
 static int try_discover_acpi(nanos_tpm tpm)
 {
-    /* TODO(nanos-integration): resolve ACPI TPM2 table -> mmio_base +
-     * mmio_length via Nanos's acpica-backed table lookup. Requires an
-     * AcpiGetTable(ACPI_SIG_TPM2, ...) call and a subsequent map()
-     * against the returned address. Deferred to a follow-up commit
-     * so that we ship a working QEMU fallback in Phase N2. */
-    (void)tpm;
-    return TPM_ERR_NO_DEVICE;
+    ACPI_TABLE_HEADER *t;
+    ACPI_STATUS rv = AcpiGetTable(ACPI_SIG_TPM2, 1, &t);
+    if (ACPI_FAILURE(rv))
+        return TPM_ERR_NO_DEVICE;
+
+    /* Header sanity: length must cover at least the fixed rev-4 body. */
+    if (t->Length < sizeof(ACPI_TABLE_TPM2)) {
+        AcpiPutTable(t);
+        return TPM_ERR_NO_DEVICE;
+    }
+
+    ACPI_TABLE_TPM2 *tpm2 = (ACPI_TABLE_TPM2 *)t;
+    u64 ctrl_addr = tpm2->ControlAddress;
+    u32 start     = tpm2->StartMethod;
+    AcpiPutTable(t);
+
+    if (start != ACPI_TPM2_COMMAND_BUFFER &&
+        start != ACPI_TPM2_COMMAND_BUFFER_WITH_ARM_SMC)
+        return TPM_ERR_UNSUPPORTED;
+
+    if (!ctrl_addr)
+        return TPM_ERR_NO_DEVICE;
+
+    u64 length = CRB_QEMU_DEFAULT_MMIO_LEN;
+    void *mapped = tpm_map_mmio(ctrl_addr, length);
+    if (!mapped)
+        return TPM_ERR_INTERNAL;
+
+    tpm->mmio_base   = mapped;
+    tpm->mmio_length = length;
+    tpm->mmio_ops    = crb_mmio_ops_real(mapped, length);
+
+    if (!tpm->mmio_ops || !crb_interface_plausible(tpm)) {
+        tpm_unmap_mmio(mapped, length);
+        tpm->mmio_base   = 0;
+        tpm->mmio_length = 0;
+        tpm->mmio_ops    = 0;
+        return TPM_ERR_NO_DEVICE;
+    }
+
+    tpm->discovery_source = TPM_DISCOVERY_ACPI;
+    return TPM_ERR_OK;
 }
 
 static int try_discover_platform(nanos_tpm tpm)
@@ -242,13 +303,18 @@ int nanos_tpm_discover(nanos_tpm *out, const crb_mmio_ops *ops)
         return TPM_ERR_OK;
     }
 
-    /* Ordered discovery per sec 4.4. */
+    /* Ordered discovery per sec 4.4. Any non-OK outcome from an earlier
+     * stage (missing table, unsupported start method, mapping failure,
+     * or malformed CRB registers) falls through to the next stage - the
+     * QEMU fixed-base fallback is the final safety net for bare-hardware
+     * setups without an emitted TPM2 table and for developer QEMU
+     * configurations that omit ACPI TPM2 wiring. */
     int s = try_discover_acpi(tpm);
-    if (s == TPM_ERR_NO_DEVICE)
+    if (s != TPM_ERR_OK)
         s = try_discover_platform(tpm);
-    if (s == TPM_ERR_NO_DEVICE)
+    if (s != TPM_ERR_OK)
         s = try_discover_manifest(tpm);
-    if (s == TPM_ERR_NO_DEVICE)
+    if (s != TPM_ERR_OK)
         s = try_discover_qemu_fixed(tpm);
 
     if (s != TPM_ERR_OK) {
