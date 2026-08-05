@@ -96,6 +96,8 @@ SRCS-kernel.elf= \
 	$(SRCDIR)/virtio/virtio_socket.c \
 	$(SRCDIR)/virtio/virtqueue.c \
 	$(SRCDIR)/virtio/scsi.c \
+	$(SRCDIR)/tpm/tpm_crb.c \
+	$(SRCDIR)/tpm/tpm_syscall.c \
 	$(SRCDIR)/vmware/vmxnet3_net.c \
 	$(SRCDIR)/vmware/vmxnet3_queue.c \
 	$(SRCDIR)/vmware/pvscsi.c \
