@@ -22,6 +22,8 @@ PROGRAMS= \
 	random_test \
 	rbtree_test \
 	table_test \
+	tpm_crb_test \
+	tpm_syscall_test \
 	tuple_test \
 	udp_test \
 	vector_test
@@ -113,6 +115,17 @@ SRCS-table_test= \
 	$(SRCDIR)/unix_process/unix_process_runtime.c \
 	$(SRCDIR)/unix_process/mmap_heap.c
 
+SRCS-tpm_crb_test= \
+	$(CURDIR)/tpm_crb_test.c \
+	$(CURDIR)/tpm_crb_fake_mmio.c \
+	$(RUNTIME)\
+	$(SRCDIR)/unix_process/unix_process_runtime.c
+
+SRCS-tpm_syscall_test= \
+	$(CURDIR)/tpm_syscall_test.c \
+	$(RUNTIME)\
+	$(SRCDIR)/unix_process/unix_process_runtime.c
+
 SRCS-tuple_test= \
 	$(CURDIR)/tuple_test.c \
 	$(RUNTIME)\
@@ -138,6 +151,7 @@ CFLAGS+=	-O3 \
 		-I$(SRCDIR) \
 		-I$(SRCDIR)/http \
 		-I$(SRCDIR)/runtime \
+		-I$(SRCDIR)/tpm \
 		-I$(SRCDIR)/unix_process \
 		-I$(SRCDIR)/unix \
 #CFLAGS+=	-DENABLE_MSG_DEBUG -DID_HEAP_DEBUG
